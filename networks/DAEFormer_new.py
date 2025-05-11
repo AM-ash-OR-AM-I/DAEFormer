@@ -3,7 +3,6 @@ import torch.nn as nn
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.nn import functional as F
-import pywt
 
 from networks.segformer import *
 
@@ -210,7 +209,7 @@ class ChannelAttention(nn.Module):
 
 class WaveletAttention(nn.Module):
     """
-    Wavelet-based attention module that uses wavelet transform for spatial attention
+    Optimized Wavelet-based attention module that processes all channels in parallel
     Input -> x:[B, D, H, W]
     Output -> [B, D, H, W]
     """
@@ -218,7 +217,6 @@ class WaveletAttention(nn.Module):
     def __init__(self, in_channels, wavelet="db1", level=1):
         super().__init__()
         self.in_channels = in_channels
-        self.wavelet = wavelet
         self.level = level
 
         # Learnable parameters for wavelet coefficients
@@ -226,94 +224,108 @@ class WaveletAttention(nn.Module):
         self.beta = nn.Parameter(torch.ones(1))
 
         # Convolution layers for processing wavelet coefficients
-        self.conv1 = nn.Conv2d(1, 1, 1)
-        self.conv2 = nn.Conv2d(1, 1, 1)
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 1)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, 1)
+
+        # Pre-compute wavelet filters
+        self.register_buffer(
+            "low_pass", torch.tensor([0.7071, 0.7071]).view(1, 1, 1, 2)
+        )
+        self.register_buffer(
+            "high_pass", torch.tensor([-0.7071, 0.7071]).view(1, 1, 1, 2)
+        )
+
+    def dwt2d(self, x):
+        """2D Discrete Wavelet Transform using PyTorch operations"""
+        B, C, H, W = x.shape
+
+        # Ensure dimensions are even
+        if H % 2 != 0:
+            x = F.pad(x, (0, 0, 0, 1))
+        if W % 2 != 0:
+            x = F.pad(x, (0, 1, 0, 0))
+
+        # Horizontal transform
+        x = x.view(B, C, -1, 2)
+        x = x.permute(0, 1, 3, 2)
+        x = x.view(B, C, 2, -1)
+
+        # Apply filters
+        low = F.conv2d(x, self.low_pass, padding=(0, 0))
+        high = F.conv2d(x, self.high_pass, padding=(0, 0))
+
+        # Vertical transform
+        low = low.view(B, C, -1, 2)
+        low = low.permute(0, 1, 3, 2)
+        low = low.view(B, C, 2, -1)
+
+        high = high.view(B, C, -1, 2)
+        high = high.permute(0, 1, 3, 2)
+        high = high.view(B, C, 2, -1)
+
+        # Apply filters again
+        ll = F.conv2d(low, self.low_pass, padding=(0, 0))
+        lh = F.conv2d(low, self.high_pass, padding=(0, 0))
+        hl = F.conv2d(high, self.low_pass, padding=(0, 0))
+        hh = F.conv2d(high, self.high_pass, padding=(0, 0))
+
+        # Reshape back to spatial dimensions
+        H, W = H // 2, W // 2
+        ll = ll.view(B, C, H, W)
+        lh = lh.view(B, C, H, W)
+        hl = hl.view(B, C, H, W)
+        hh = hh.view(B, C, H, W)
+
+        return ll, lh, hl, hh
+
+    def idwt2d(self, ll, lh, hl, hh):
+        """2D Inverse Discrete Wavelet Transform using PyTorch operations"""
+        B, C, H, W = ll.shape
+
+        # Reshape for inverse transform
+        ll = ll.view(B, C, -1)
+        lh = lh.view(B, C, -1)
+        hl = hl.view(B, C, -1)
+        hh = hh.view(B, C, -1)
+
+        # Inverse vertical transform
+        low = torch.cat([ll, lh], dim=2)
+        high = torch.cat([hl, hh], dim=2)
+
+        # Inverse horizontal transform
+        x = torch.cat([low, high], dim=2)
+        x = x.view(B, C, 2, -1)
+        x = x.permute(0, 1, 3, 2)
+        x = x.view(B, C, -1, 2)
+
+        return x
 
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # Process each channel separately
-        output = []
-        for b in range(B):
-            channel_outputs = []
-            for c in range(C):
-                # Convert to numpy for wavelet transform
-                signal = x[b, c].detach().cpu().numpy()
+        # Perform wavelet transform
+        ll, lh, hl, hh = self.dwt2d(x)
 
-                # Perform wavelet transform
-                coeffs = pywt.wavedec2(signal, self.wavelet, level=self.level)
+        # Process approximation coefficients
+        ll = self.conv1(ll)
 
-                # Process approximation coefficients
-                cA = torch.from_numpy(coeffs[0]).to(x.device)
-                cA = cA.unsqueeze(0).unsqueeze(0)  # [1, 1, H', W']
-                cA = self.conv1(cA)
+        # Process detail coefficients
+        lh = self.conv2(lh)
+        hl = self.conv2(hl)
+        hh = self.conv2(hh)
 
-                # Process detail coefficients
-                detail_coeffs = []
-                for i in range(1, len(coeffs)):
-                    level_details = []
-                    for j in range(3):  # Horizontal, vertical, and diagonal details
-                        detail = torch.from_numpy(coeffs[i][j]).to(x.device)
-                        detail = detail.unsqueeze(0).unsqueeze(0)  # [1, 1, H', W']
-                        detail = self.conv2(detail)
-                        # Resize detail to match approximation size
-                        if detail.shape != cA.shape:
-                            detail = F.interpolate(
-                                detail,
-                                size=cA.shape[2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                        level_details.append(detail)
-                    detail_coeffs.extend(level_details)
+        # Combine coefficients with learnable weights
+        detail_sum = lh + hl + hh
+        combined = self.alpha * ll + self.beta * detail_sum
 
-                # Sum all detail coefficients (now they have the same size)
-                detail_sum = sum(detail_coeffs)
+        # Perform inverse transform
+        output = self.idwt2d(combined, lh, hl, hh)
 
-                # Combine coefficients with learnable weights
-                combined = self.alpha * cA + self.beta * detail_sum
-
-                # Prepare coefficients for inverse transform
-                processed_coeffs = [combined.detach().squeeze().cpu().numpy()]
-
-                # Reconstruct detail coefficients for each level
-                detail_idx = 0
-                for i in range(1, len(coeffs)):
-                    level_coeffs = []
-                    for j in range(3):
-                        if detail_idx < len(detail_coeffs):
-                            # Resize back to original detail coefficient size
-                            detail = F.interpolate(
-                                detail_coeffs[detail_idx],
-                                size=coeffs[i][j].shape,
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                            detail = detail.detach().squeeze().cpu().numpy()
-                            level_coeffs.append(detail)
-                            detail_idx += 1
-                        else:
-                            level_coeffs.append(coeffs[i][j])
-                    processed_coeffs.append(tuple(level_coeffs))
-
-                # Perform inverse wavelet transform
-                reconstructed = pywt.waverec2(processed_coeffs, self.wavelet)
-
-                # Ensure the output has the same size as input
-                if reconstructed.shape != (H, W):
-                    reconstructed = reconstructed[:H, :W]
-
-                # Convert back to tensor
-                reconstructed = torch.from_numpy(reconstructed).to(x.device)
-                reconstructed = reconstructed.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                channel_outputs.append(reconstructed)
-
-            # Combine channel outputs
-            channel_output = torch.cat(channel_outputs, dim=1)  # [1, C, H, W]
-            output.append(channel_output)
-
-        # Combine batch outputs
-        output = torch.cat(output, dim=0)  # [B, C, H, W]
+        # Ensure output has same size as input
+        if output.shape != x.shape:
+            output = F.interpolate(
+                output, size=(H, W), mode="bilinear", align_corners=False
+            )
 
         return output
 
